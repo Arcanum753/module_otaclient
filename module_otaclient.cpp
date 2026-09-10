@@ -23,7 +23,7 @@ CLASS_MODULE_OTACLIENT module_otaclient;
 // Static manifest entries buffer (avoid stack allocation)
 ManifestEntry CLASS_MODULE_OTACLIENT::_manifestEntries[OTACLIENT_MAX_MANIFEST_ENTRIES];
 
-CLASS_MODULE_OTACLIENT::CLASS_MODULE_OTACLIENT() : CLASS_CORE_OTA(true) {
+CLASS_MODULE_OTACLIENT::CLASS_MODULE_OTACLIENT() {
     _isStarted = false;
     _updateInProgress = false;
     _updateRetries = 0;
