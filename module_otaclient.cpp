@@ -5,13 +5,13 @@
 #include <WiFiClient.h>
 #if defined(ESP32)
 #include <Update.h>
-#include <HTTPClient.h>
-#elif defined(ESP8266)
-#include <ESP8266HTTPClient.h>
+#endif
+#if defined(ESP8266)
 #include <ArduinoOTA.h>
 #endif
 #include <core_ntp/NtpClientLib.h>
 #include "core_json/core_json.h"
+#include "core_sys/core_sys.h"
 #include "module_otaclient/module_otaclient.h"
 #include "core_sys/eertos.h"
 #include "common/common.h"
@@ -296,8 +296,8 @@ uint8_t CLASS_MODULE_OTACLIENT::isStart()              { return _isStarted; }
 String CLASS_MODULE_OTACLIENT::jsonGet() {
     String ret = "";
     ret += "{\n";
-    ret += "  \"deviceName\": \"" + ESPHTTPServer._sysConfig.deviceName + "\",\n";
-    ret += "  \"deviceSerial\": \"" + ESPHTTPServer._sysConfig.deviceSerial + "\",\n";
+    ret += "  \"deviceName\": \"" + core_sys.getDeviceName() + "\",\n";
+    ret += "  \"deviceSerial\": \"" + core_sys.getDeviceSerial() + "\",\n";
     ret += "  \"ip\": \"" + WiFi.localIP().toString() + "\",\n";
     ret += "  \"mac\": \"" + WiFi.macAddress() + "\",\n";
     ret += "  \"timeOut\": " + String(_config.timeOut) + ",\n";
@@ -474,6 +474,115 @@ void CLASS_MODULE_OTACLIENT::loop() {
 }
 
 // ============================================================
+// Мини-HTTP клиент поверх WiFiClient (без TLS/HTTPClient).
+// Сервер обновлений локальный (http://), поэтому HTTPS не требуется:
+// HTTPClient тянет WiFiClientSecure + mbedTLS (~сотни КБ) без пользы.
+// ============================================================
+
+// Поток тела HTTP-ответа: поддержка Content-Length и chunked.
+class HttpBodyStream : public Stream {
+public:
+    HttpBodyStream(WiFiClient& client, bool chunked)
+        : _client(client), _chunked(chunked), _chunkLeft(0), _done(false) {}
+
+    int available() {
+        if (_done) { return 0; }
+        if (_chunked) {
+            if (_chunkLeft == 0 && !nextChunk()) { return 0; }
+            int a = _client.available();
+            return (a > (int)_chunkLeft) ? (int)_chunkLeft : a;
+        }
+        return _client.available();
+    }
+
+    int read() {
+        if (_done) { return -1; }
+        if (_chunked) {
+            if (_chunkLeft == 0 && !nextChunk()) { return -1; }
+            int c = _client.read();
+            if (c < 0) { return -1; }
+            _chunkLeft--;
+            if (_chunkLeft == 0) { consumeCrlf(); }
+            return c;
+        }
+        return _client.read();
+    }
+
+    int peek() {
+        if (_chunked) { return -1; }
+        return _client.peek();
+    }
+
+    size_t write(uint8_t) { return 0; }
+    void flush() {}
+
+private:
+    bool nextChunk() {
+        String line = _client.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) { _done = true; return false; }
+        long sz = strtol(line.c_str(), NULL, 16);
+        if (sz <= 0) { _done = true; return false; }
+        _chunkLeft = (size_t)sz;
+        return true;
+    }
+
+    void consumeCrlf() {
+        uint32_t t = millis() + 100;
+        while (millis() < t) {
+            int c = _client.peek();
+            if (c == '\r' || c == '\n') { _client.read(); }
+            else { break; }
+        }
+    }
+
+    WiFiClient& _client;
+    bool        _chunked;
+    size_t      _chunkLeft;
+    bool        _done;
+};
+
+// Отправляет GET и разбирает статус/заголовки. Тело остаётся в client.
+static bool httpGetOpen(WiFiClient& client, const String& host, uint16_t port,
+                        const String& path, int& status, bool& chunked, long& contentLen) {
+    status = 0;
+    chunked = false;
+    contentLen = -1;
+
+    client.setTimeout(5000);
+    if (!client.connect(host.c_str(), port)) { return false; }
+
+    client.print(String("GET ") + path + " HTTP/1.1\r\n" +
+                 "Host: " + host + ":" + String(port) + "\r\n" +
+                 "Connection: close\r\n\r\n");
+
+    uint32_t timeout = millis() + 8000;
+    while (!client.available() && client.connected() && millis() < timeout) { delay(1); }
+    if (!client.available()) { return false; }
+
+    String statusLine = client.readStringUntil('\n');
+    statusLine.trim();
+    int sp1 = statusLine.indexOf(' ');
+    if (sp1 > 0) { status = statusLine.substring(sp1 + 1).toInt(); }
+
+    while (client.connected()) {
+        if (!client.available()) {
+            if (millis() > timeout) { break; }
+            delay(1);
+            continue;
+        }
+        String line = client.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) { break; }
+        String low = line;
+        low.toLowerCase();
+        if (low.startsWith("transfer-encoding:") && low.indexOf("chunked") >= 0) { chunked = true; }
+        if (low.startsWith("content-length:")) { contentLen = line.substring(15).toInt(); }
+    }
+    return (status > 0);
+}
+
+// ============================================================
 // FETCH MANIFEST from OTA server
 // ============================================================
 bool CLASS_MODULE_OTACLIENT::fetchManifest(ManifestEntry* entries, int& count) {
@@ -485,106 +594,61 @@ bool CLASS_MODULE_OTACLIENT::fetchManifest(ManifestEntry* entries, int& count) {
     }
     
 #if defined(ESP8266)
-    // ESP8266: используем прямой WiFiClient с ручным WDT feed
-    // чтобы избежать Soft WDT reset при длительных HTTP-запросах
     if (ESP.getFreeHeap() < 10000) {
         DEBUGOTACLIENT("fetchManifest: low memory (%d bytes), skipping\n", ESP.getFreeHeap());
         return false;
     }
 #endif
-    
-    String url = "http://" + _config.serverAddress + ":" + String(_config.serverPort) + _config.manifestPath + "?target=" + BUILD_ENV + "&ver=" + FIRMWARE_VERSION;
-    DEBUGOTACLIENT("fetchManifest: %s\n", url.c_str());
-    
-#if defined(ESP8266)
-    // Прямое подключение WiFiClient с ручным чтением и WDT feed
+
     WiFiClient client;
-    client.setTimeout(5000);
-    
-    if (!client.connect(_config.serverAddress.c_str(), _config.serverPort)) {
-        DEBUGOTACLIENT("fetchManifest: connect failed\n");
+    int status = 0;
+    bool chunked = false;
+    long contentLen = -1;
+    String path = _config.manifestPath + "?target=" + BUILD_ENV + "&ver=" + FIRMWARE_VERSION;
+    DEBUGOTACLIENT("fetchManifest: http://%s:%d%s\n",
+                   _config.serverAddress.c_str(), (int)_config.serverPort, path.c_str());
+
+    if (!httpGetOpen(client, _config.serverAddress, (uint16_t)_config.serverPort,
+                     path, status, chunked, contentLen)) {
+        DEBUGOTACLIENT("fetchManifest: connect/open failed\n");
         return false;
     }
-    
-    // Отправляем HTTP GET запрос вручную с query-параметрами
-    client.print(String("GET ") + _config.manifestPath + "?target=" + BUILD_ENV + "&ver=" + FIRMWARE_VERSION + " HTTP/1.1\r\n" +
-                 "Host: " + _config.serverAddress + ":" + String(_config.serverPort) + "\r\n" +
-                 "Connection: close\r\n\r\n");
-    
-    // Читаем ответ с WDT feed
-    // Используем поблочное чтение вместо построчного, чтобы корректно
-    // обрабатывать chunked transfer encoding и длинные строки JSON
-    unsigned long timeout = millis() + 5000;
+    if (status != 200) {
+        DEBUGOTACLIENT("fetchManifest: HTTP error %d\n", status);
+        client.stop();
+        return false;
+    }
+
+    // Читаем тело (Content-Length или chunked) с WDT feed.
     String payload = "";
-    bool headersEnded = false;
-    
+    HttpBodyStream body(client, chunked);
+    uint32_t timeout = millis() + 8000;
     while (millis() < timeout) {
-        if (client.available()) {
-            if (!headersEnded) {
-                String line = client.readStringUntil('\n');
-                line.trim();
-                if (line == "") {
-                    headersEnded = true;
-                }
-                continue;
+        if (body.available() > 0) {
+            int c = body.read();
+            if (c < 0) { break; }
+            payload += (char)c;
+            if (payload.length() > 4096) {  // Жёсткий лимит: 4096 байт
+                DEBUGOTACLIENT("fetchManifest: payload too large\n");
+                client.stop();
+                return false;
             }
-            
-            // Поблочное чтение тела ответа
-            while (client.available()) {
-                int c = client.read();
-                if (c == -1) break;
-                payload += (char)c;
-                if (payload.length() > 4096) {  // Жёсткий лимит: 4096 байт
-                    DEBUGOTACLIENT("fetchManifest: payload too large\n");
-                    client.stop();
-                    return false;
-                }
-            }
+        } else if (!client.connected()) {
+            break;
         } else {
-            if (headersEnded && !client.connected()) {
-                break;
-            }
             delay(1);
+#if defined(ESP8266)
             ESP.wdtFeed();
+#endif
         }
     }
-    
     client.stop();
-    
-    if (!headersEnded || payload.length() == 0) {
+
+    if (payload.length() == 0) {
         DEBUGOTACLIENT("fetchManifest: timeout or empty response\n");
         return false;
     }
-    
     DEBUGOTACLIENT("fetchManifest: received %d bytes\n", payload.length());
-#else
-    // ESP32: используем HTTPClient (более производительный)
-    WiFiClient client;
-    HTTPClient http;
-    http.setTimeout(10000);
-    
-    if (!http.begin(client, url)) {
-        DEBUGOTACLIENT("fetchManifest: http.begin failed\n");
-        return false;
-    }
-    
-    int httpCode = http.GET();
-    if (httpCode != 200) {
-        DEBUGOTACLIENT("fetchManifest: HTTP error %d\n", httpCode);
-        http.end();
-        return false;
-    }
-    
-    String payload = http.getString();
-    http.end();
-    
-    if (payload.length() > 2048) {  // Жёсткий лимит: 2048 байт для всех клиентов
-        DEBUGOTACLIENT("fetchManifest: payload too large (%d bytes)\n", payload.length());
-        return false;
-    }
-    
-    DEBUGOTACLIENT("fetchManifest: received %d bytes\n", payload.length());
-#endif
     
     // Parse JSON
     bool hasFiles = false;
@@ -708,7 +772,7 @@ void CLASS_MODULE_OTACLIENT::checkManifestEntries(ManifestEntry* entries, int co
 // ============================================================
 // PERFORM UPDATE FROM STREAM
 // ============================================================
-bool CLASS_MODULE_OTACLIENT::performUpdateFromStream(WiFiClient& stream, size_t size, const String& expectedMd5, int fileType) {
+bool CLASS_MODULE_OTACLIENT::performUpdateFromStream(Stream& stream, size_t size, const String& expectedMd5, int fileType) {
     DEBUGOTACLIENT("performUpdateFromStream: size=%u, type=%d, md5=%s\n", size, fileType, expectedMd5.c_str());
     
     // Set MD5 for verification
@@ -826,35 +890,47 @@ bool CLASS_MODULE_OTACLIENT::performUpdateFromStream(WiFiClient& stream, size_t 
 // ============================================================
 bool CLASS_MODULE_OTACLIENT::downloadAndUpdate(const String& url, size_t size, const String& md5, int fileType) {
     DEBUGOTACLIENT("downloadAndUpdate: %s (%u bytes)\n", url.c_str(), size);
-    
+
+    // url вида http://host:port/path — разбираем вручную (локальный сервер, только HTTP).
+    String rest = url;
+    if (rest.startsWith("http://")) { rest = rest.substring(7); }
+    int slash = rest.indexOf('/');
+    String hostPort = (slash >= 0) ? rest.substring(0, slash) : rest;
+    String path = (slash >= 0) ? rest.substring(slash) : String("/");
+
+    String host = hostPort;
+    uint16_t port = 80;
+    int colon = hostPort.indexOf(':');
+    if (colon >= 0) {
+        host = hostPort.substring(0, colon);
+        port = (uint16_t)hostPort.substring(colon + 1).toInt();
+    }
+
     WiFiClient client;
-    HTTPClient http;
-    http.setTimeout(30000); // 30 second timeout for download
-    
-    if (!http.begin(client, url)) {
-        DEBUGOTACLIENT("downloadAndUpdate: http.begin failed\n");
+    int status = 0;
+    bool chunked = false;
+    long contentLen = -1;
+    if (!httpGetOpen(client, host, port, path, status, chunked, contentLen)) {
+        DEBUGOTACLIENT("downloadAndUpdate: connect/open failed\n");
         return false;
     }
-    
-    int httpCode = http.GET();
-    if (httpCode != 200) {
-        DEBUGOTACLIENT("downloadAndUpdate: HTTP error %d\n", httpCode);
-        http.end();
+    if (status != 200) {
+        DEBUGOTACLIENT("downloadAndUpdate: HTTP error %d\n", status);
+        client.stop();
         return false;
     }
-    
-    // Verify content length matches expected size
-    int contentLength = http.getSize();
-    if (contentLength > 0 && (size_t)contentLength != size) {
-        DEBUGOTACLIENT("downloadAndUpdate: size mismatch! expected %u, got %d\n", size, contentLength);
-        http.end();
+
+    // Verify content length matches expected size (при chunked длина неизвестна)
+    if (!chunked && contentLen > 0 && (size_t)contentLen != size) {
+        DEBUGOTACLIENT("downloadAndUpdate: size mismatch! expected %u, got %ld\n", size, contentLen);
+        client.stop();
         return false;
     }
-    
-    WiFiClient* stream = http.getStreamPtr();
-    bool success = performUpdateFromStream(*stream, size, md5, fileType);
-    
-    http.end();
+
+    client.setTimeout(30000); // 30 second timeout for download
+    HttpBodyStream body(client, chunked);
+    bool success = performUpdateFromStream(body, size, md5, fileType);
+    client.stop();
     return success;
 }
 

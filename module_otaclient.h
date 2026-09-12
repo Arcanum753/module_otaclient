@@ -101,7 +101,7 @@ private:
     bool downloadAndUpdate(const String& url, size_t size, const String& md5, int fileType);
     
     // Perform actual update from stream
-    bool performUpdateFromStream(WiFiClient& stream, size_t size, const String& expectedMd5, int fileType);
+    bool performUpdateFromStream(Stream& stream, size_t size, const String& expectedMd5, int fileType);
     
     // Unified manifest entry checking (used by test() and checkForUpdates())
     void checkManifestEntries(ManifestEntry* entries, int count,
