@@ -28,6 +28,7 @@ public:
     
     void send_configuration_values_html(AsyncWebServerRequest *request);
     void get_configuration_html(AsyncWebServerRequest *request);
+    void setTargetEnv(AsyncWebServerRequest *request);
     
     uint16_t getTimeOut();
     bool powerOnGet();
@@ -50,11 +51,18 @@ private:
     bool save_config();
     void defaultConfig();
     
+    // Смена сборки: целевой env (targetEnv) и режим форсированной прошивки
+    String effectiveTargetEnv();
+    bool isSwitchMode();
+    
     // Manifest download and parsing
     bool fetchManifest(ManifestEntry* entries, int& count);
     
     // Download and flash a single file
     bool downloadAndUpdate(const String& url, size_t size, const String& md5, int fileType);
+    
+    // Download+flash манифест-записи (общий путь для обычного режима и смены сборки)
+    bool updateFromEntry(const ManifestEntry* entry, int fileType);
     
     // Perform actual update from stream
     bool performUpdateFromStream(Stream& stream, size_t size, const String& expectedMd5, int fileType);

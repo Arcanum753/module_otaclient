@@ -22,6 +22,9 @@
 // Max entries in manifest
 #define OTACLIENT_MAX_MANIFEST_ENTRIES 20
 
+// Максимальная длина имени целевого env при смене сборки
+#define OTACLIENT_TARGET_ENV_MAX 32
+
 // Max retries for update download
 #define OTACLIENT_MAX_RETRIES     3
 
@@ -47,6 +50,7 @@ typedef struct {
     String serverAddress;
     uint16_t serverPort;
     String manifestPath;
+    String targetEnv;      // целевой env для смены сборки ("" = своя сборка BUILD_ENV)
 } strOtaClientConfig;
 
 // Structure for a single manifest entry

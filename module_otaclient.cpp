@@ -69,6 +69,12 @@ void CLASS_MODULE_OTACLIENT::registerCustomRoutes() {
         test(request);
     });
     
+    // Смена сборки: установка целевого env (одноразовый флаг; применяется на след. проверке)
+    ESPHTTPServer.on("/otaclient/target", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        if (!ESPHTTPServer.checkAuth(request)) {return request->requestAuthentication(); }
+        setTargetEnv(request);
+    });
+    
     // Test status endpoint (polled by JS)
     ESPHTTPServer.on("/otaclient/teststatus", [this](AsyncWebServerRequest *request) {
         if (!ESPHTTPServer.checkAuth(request)) {return request->requestAuthentication(); }
@@ -137,6 +143,8 @@ void CLASS_MODULE_OTACLIENT::send_configuration_values_html(AsyncWebServerReques
     values += "otaclientaddr|"  + _config.serverAddress + "|input\n";
     values += "otaclientport|"  + String(_config.serverPort) + "|input\n";
     values += "otaclientmanifest|" + _config.manifestPath + "|input\n";
+    values += "otaclienttarget|"    + effectiveTargetEnv() + "|input\n";
+    values += "otaclientbuildenv|"  + String(BUILD_ENV) + "|div\n";
     request->send(200, "text/plain", values);
 }
 
@@ -165,6 +173,44 @@ void CLASS_MODULE_OTACLIENT::get_configuration_html(AsyncWebServerRequest *reque
     }
 }
 
+// ========== SET TARGET ENV (смена сборки) ==========
+void CLASS_MODULE_OTACLIENT::setTargetEnv(AsyncWebServerRequest *request) {
+    DEBUGOTACLIENT("%s\n\r", __FUNCTION__);
+    String target = request->hasArg("otaclienttarget") ? urldecode(request->arg("otaclienttarget")) : "";
+    target.trim();
+
+    // Пустая строка — вернуться к своей сборке
+    if (target.length() > 0) {
+        // Валидация: только [A-Za-z0-9_-], длина до OTACLIENT_TARGET_ENV_MAX
+        if (target.length() > OTACLIENT_TARGET_ENV_MAX) {
+            request->send(400, "application/json", "{\"success\":false,\"error\":\"target too long\"}");
+            return;
+        }
+        for (size_t i = 0; i < target.length(); i++) {
+            char c = target.charAt(i);
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_';
+            if (!ok) {
+                request->send(400, "application/json", "{\"success\":false,\"error\":\"invalid target\"}");
+                return;
+            }
+        }
+        // Совпадение со своей сборкой — обычный режим
+        if (target == String(BUILD_ENV)) { target = ""; }
+    }
+
+    String prevTarget = _config.targetEnv;
+    _config.targetEnv = target;
+    if (!save_config()) {
+        _config.targetEnv = prevTarget;
+        request->send(500, "application/json", "{\"success\":false,\"error\":\"save failed\"}");
+        return;
+    }
+
+    String json = "{\"success\":true,\"target\":\"" + effectiveTargetEnv() + "\"}";
+    request->send(200, "application/json", json);
+}
+
 // ============================================================
 // Конфиг
 // ============================================================
@@ -176,6 +222,7 @@ void CLASS_MODULE_OTACLIENT::defaultConfig() {
     _config.serverAddress = OTACLIENT_SERVER_ADDR;
     _config.serverPort = OTACLIENT_SERVER_PORT;
     _config.manifestPath = OTACLIENT_MANIFEST_PATH;
+    _config.targetEnv = "";
 }
 
 // ========== SAVE CONFIG ==========
@@ -188,6 +235,7 @@ bool CLASS_MODULE_OTACLIENT::save_config() {
     doc["serverAddress"] = _config.serverAddress;
     doc["serverPort"] = _config.serverPort;
     doc["manifestPath"] = _config.manifestPath;
+    doc["targetEnv"] = _config.targetEnv;
     return core_json.jsonFileSaveDoc(CONFIG_FILE_OTACLIENT, doc);
 }
 
@@ -201,6 +249,7 @@ bool CLASS_MODULE_OTACLIENT::load_config() {
     _config.serverAddress = doc["serverAddress"].as<String>();
     _config.serverPort = doc["serverPort"].as<uint16_t>();
     _config.manifestPath = doc["manifestPath"].as<String>();
+    _config.targetEnv = doc["targetEnv"].as<String>();
     
     DEBUGOTACLIENT("timeOut: %d\n\r", _config.timeOut);
     DEBUGOTACLIENT("powerOn: %d\n\r", _config.powerOn);

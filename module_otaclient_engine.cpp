@@ -64,6 +64,15 @@ uint16_t CLASS_MODULE_OTACLIENT::serverPortGet()       { return _config.serverPo
 String CLASS_MODULE_OTACLIENT::manifestPathGet()       { return _config.manifestPath; }
 uint8_t CLASS_MODULE_OTACLIENT::isStart()              { return _isStarted; }
 
+// ========== TARGET ENV (смена сборки) ==========
+String CLASS_MODULE_OTACLIENT::effectiveTargetEnv() {
+    return (_config.targetEnv.length() > 0) ? _config.targetEnv : String(BUILD_ENV);
+}
+
+bool CLASS_MODULE_OTACLIENT::isSwitchMode() {
+    return (_config.targetEnv.length() > 0) && (_config.targetEnv != String(BUILD_ENV));
+}
+
 // ========== JSON GET ==========
 String CLASS_MODULE_OTACLIENT::jsonGet() {
     String ret = "";
@@ -229,6 +238,13 @@ void CLASS_MODULE_OTACLIENT::loop() {
     if (_testStatusCode == OTACLIENT_TEST_UPDATING) {
         _testStatusCode = OTACLIENT_TEST_IDLE;
         
+        // Смена сборки: кнопка "Update Now" запускает полный цикл (FW + FS целевого env)
+        if (isSwitchMode()) {
+            DEBUGOTACLIENT("Loop: switch mode, running full update cycle\n");
+            checkForUpdates();
+            return;
+        }
+        
         if (_testUpdateName.length() > 0 && _testUpdateUrl.length() > 0) {
             DEBUGOTACLIENT("Loop: starting update for %s\n", _testUpdateName.c_str());
             bool ok = downloadAndUpdate(_testUpdateUrl, _testUpdateSize, _testUpdateMd5, _testUpdateFileType);
@@ -376,7 +392,8 @@ bool CLASS_MODULE_OTACLIENT::fetchManifest(ManifestEntry* entries, int& count) {
     int status = 0;
     bool chunked = false;
     long contentLen = -1;
-    String path = _config.manifestPath + "?target=" + BUILD_ENV + "&ver=" + FIRMWARE_VERSION;
+    String target = effectiveTargetEnv();
+    String path = _config.manifestPath + "?target=" + target + "&ver=" + FIRMWARE_VERSION;
     DEBUGOTACLIENT("fetchManifest: http://%s:%d%s\n",
                    _config.serverAddress.c_str(), (int)_config.serverPort, path.c_str());
 
@@ -425,7 +442,7 @@ bool CLASS_MODULE_OTACLIENT::fetchManifest(ManifestEntry* entries, int& count) {
     // Parse JSON
     bool hasFiles = false;
     if (!core_json.jsonParseNestedBool(payload, "has_files", hasFiles) || !hasFiles) {
-        DEBUGOTACLIENT("fetchManifest: no files for target %s on server\n", BUILD_ENV);
+        DEBUGOTACLIENT("fetchManifest: no files for target %s on server\n", target.c_str());
         return false;
     }
     
@@ -476,9 +493,13 @@ void CLASS_MODULE_OTACLIENT::checkManifestEntries(ManifestEntry* entries, int co
     ManifestEntry* fsEntry = NULL;
     int bestFwBuild = -1, bestFsBuild = -1;
     
-    // Разделители имени файла для текущего устройства (строгое совпадение префикса)
-    String fwSeparator = String(BUILD_ENV) + OTA_STR_SEPARATOR_FIRMWARE;
-    String fsSeparator = String(BUILD_ENV) + OTA_STR_SEPARATOR_FILESYSTEM;
+    // Целевой env: свой BUILD_ENV или выбранный для смены сборки
+    String target = effectiveTargetEnv();
+    bool force = isSwitchMode();
+    
+    // Разделители имени файла для целевого устройства (строгое совпадение префикса)
+    String fwSeparator = target + OTA_STR_SEPARATOR_FIRMWARE;
+    String fsSeparator = target + OTA_STR_SEPARATOR_FILESYSTEM;
     
     for (int i = 0; i < count; i++) {
         int build = -1;
@@ -517,6 +538,20 @@ void CLASS_MODULE_OTACLIENT::checkManifestEntries(ManifestEntry* entries, int co
     fsValid = false;
     fwCompareResult = 0;
     fsCompareResult = 0;
+    
+    if (force) {
+        // Смена сборки: сравнение версий чужого env не имеет смысла — форсируем прошивку
+        // любых найденных файлов целевого env (берём самый свежий build).
+        fwValid = (firmwareEntry != NULL);
+        fsValid = (fsEntry != NULL);
+        fwCompareResult = fwValid ? 1 : -2;
+        fsCompareResult = fsValid ? 1 : -2;
+        DEBUGOTACLIENT("Switch mode active (target=%s): fwValid=%d, fsValid=%d\n",
+                       target.c_str(), fwValid, fsValid);
+        fwEntryOut = firmwareEntry;
+        fsEntryOut = fsEntry;
+        return;
+    }
     
     if (firmwareEntry) {
         int8_t ret = fileNameCheck(firmwareEntry->name, &fwResult);
@@ -561,8 +596,8 @@ bool CLASS_MODULE_OTACLIENT::performUpdateFromStream(Stream& stream, size_t size
     if (fileType == FILE_TYPE_FILESYSTEM) { updatePartition = U_FS; }
 #endif
     
-    // End filesystem before update
-    fsEnd();
+    // End filesystem before update (не завершать повторно при FW→FS в одном цикле)
+    if (!_fsEnded) { fsEnd(); }
     _fsEnded = true;
     
 #if defined(ESP8266)
@@ -708,6 +743,17 @@ bool CLASS_MODULE_OTACLIENT::downloadAndUpdate(const String& url, size_t size, c
 }
 
 // ============================================================
+// DOWNLOAD AND FLASH A MANIFEST ENTRY (общий путь обновления)
+// ============================================================
+bool CLASS_MODULE_OTACLIENT::updateFromEntry(const ManifestEntry* entry, int fileType) {
+    if (!entry) { return false; }
+    String url = "http://" + _config.serverAddress + ":" + String(_config.serverPort) + "/firmware/" + entry->name;
+    DEBUGOTACLIENT("Updating %s from %s\n",
+                   (fileType == FILE_TYPE_FIRMWARE) ? "firmware" : "FS", url.c_str());
+    return downloadAndUpdate(url, entry->size, entry->md5, fileType);
+}
+
+// ============================================================
 // CHECK FOR UPDATES (main logic)
 // ============================================================
 void CLASS_MODULE_OTACLIENT::checkForUpdates() {
@@ -755,37 +801,66 @@ void CLASS_MODULE_OTACLIENT::checkForUpdates() {
     // Stop the loop task timer to prevent re-entrancy during update
     DelTimerTask(otaclientLoopTask);
     
+    // ========== СМЕНА СБОРКИ ==========
+    // Принудительно прошиваем FW целевого env, затем его FS, одним циклом.
+    // Рестарт — только когда прошито всё, что есть в манифесте (FW + FS).
+    // Если FS не прошился, targetEnv остаётся взведённым и попытка повторится
+    // на следующей проверке (isSwitchMode() ещё истинно, т.к. BUILD_ENV не сменился).
+    if (isSwitchMode()) {
+        if (!firmwareEntry) {
+            DEBUGOTACLIENT("Switch: no firmware for target %s, aborting\n", effectiveTargetEnv().c_str());
+            _updateInProgress = false;
+            SetTimerTask(otaclientLoopTask, 50);
+            return;
+        }
+        
+        bool fwOk = updateFromEntry(firmwareEntry, FILE_TYPE_FIRMWARE);
+        
+        bool fsOk = false;
+        if (fwOk && fsEntry) {
+            fsOk = updateFromEntry(fsEntry, FILE_TYPE_FILESYSTEM);
+        }
+        
+        if (fwOk && (!fsEntry || fsOk)) {
+            DEBUGOTACLIENT("Switch successful (fw=1, fs=%d), restarting...\n", fsOk);
+            delay(500);
+            ESPHTTPServer.restart_esp();
+            return;
+        }
+        
+        // Перезагрузка отменяется, чтобы не оставить целевую прошивку со старой ФС:
+        // повтор сработает при следующей проверке, пока targetEnv != BUILD_ENV.
+        DEBUGOTACLIENT("Switch incomplete (fw=%d, fs=%d), keeping switch armed\n", fwOk, fsOk);
+        _updateInProgress = false;
+        SetTimerTask(otaclientLoopTask, 50);
+        if (_fsEnded) {
+            fsRemount();
+            _fsEnded = false;
+        }
+        return;
+    }
+    
     // First, update filesystem if valid
     if (fsValid && fsEntry) {
-        String url = "http://" + _config.serverAddress + ":" + String(_config.serverPort) + "/firmware/" + fsEntry->name;
-        DEBUGOTACLIENT("Updating FS from %s\n", url.c_str());
-        
-        bool fsOk = downloadAndUpdate(url, fsEntry->size, fsEntry->md5, FILE_TYPE_FILESYSTEM);
-        if (fsOk) {
+        if (updateFromEntry(fsEntry, FILE_TYPE_FILESYSTEM)) {
             DEBUGOTACLIENT("FS update successful, restarting...\n");
             delay(500);
             ESPHTTPServer.restart_esp();
             return;
-        } else {
-            DEBUGOTACLIENT("FS update failed\n");
         }
+        DEBUGOTACLIENT("FS update failed\n");
     }
     
     // Then, update firmware if valid
     if (fwValid && firmwareEntry) {
-        String url = "http://" + _config.serverAddress + ":" + String(_config.serverPort) + "/firmware/" + firmwareEntry->name;
-        DEBUGOTACLIENT("Updating firmware from %s\n", url.c_str());
-        
-        bool fwOk = downloadAndUpdate(url, firmwareEntry->size, firmwareEntry->md5, FILE_TYPE_FIRMWARE);
-        if (fwOk) {
+        if (updateFromEntry(firmwareEntry, FILE_TYPE_FIRMWARE)) {
             DEBUGOTACLIENT("Firmware update successful, restarting...\n");
             delay(500);
             ESPHTTPServer.restart_esp();
             // Never reaches here after restart
             return;
-        } else {
-            DEBUGOTACLIENT("Firmware update failed\n");
         }
+        DEBUGOTACLIENT("Firmware update failed\n");
     }
     
     _updateInProgress = false;
