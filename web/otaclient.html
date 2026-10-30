@@ -14,7 +14,7 @@
     
     <div class="content" style="text-align: center;">
         <form id="configForm" onsubmit="return saveOtaConfig(event)">
-            <table class="scan" style="width: auto; margin: 0 auto;">
+            <table class="global_table_style" style="width: auto; margin: 0 auto;">
                 <tr><th colspan="2">OTA Client Settings</th></tr>
                 <tr><td class="label">OTA Client check every ... minute (0 is off)</td>    <td><input type="number" id="otaclienttime" name="otaclienttime"  min="0" max="60" value=""  onkeyup=setMinMax();></td></tr>
                 <tr><td class="label">OTA Client update on WiFi connect:</td> <td> <input type="checkbox" id="otaclientpoweron" name="otaclientpoweron"></td>  </tr>
@@ -27,7 +27,7 @@
     </div>
 
     <div class="content" style="text-align: center;">
-        <table class="scan" style="width: auto; margin: 0 auto;">
+        <table class="global_table_style" style="width: auto; margin: 0 auto;">
             <tr><th colspan="2">Смена сборки (внимание: перепрошивка устройства)</th></tr>
             <tr>
                 <td class="label">Смена сборки:</td>
@@ -48,7 +48,7 @@
 
     <div class="content" style="text-align: center;">
         <form id="upload" onsubmit="event.preventDefault(); otaClientTest()" enctype="multipart/form-data" autocomplete="off">
-            <table class="scan" style="width: auto; margin: 0 auto;">
+            <table class="global_table_style" style="width: auto; margin: 0 auto;">
                 <tr><th colspan="2">OTA Test</th></tr>
                 <tr> <td style="text-align: center; padding: 8px;"> <span title="Test OTA Client check.">
                         <input id="broadcastTest" type='submit' value='Test OTA Client' class="button-prog">
