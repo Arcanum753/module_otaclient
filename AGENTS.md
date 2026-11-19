@@ -45,8 +45,10 @@
 
 ## Слоистая структура
 
-Из `../../LAYERS.md`: `module_otaclient` — OTA-клиент: manifest, мини-HTTP; сейчас define'ы,
-`strOtaClientConfig`, `ManifestEntry`; выделить `_types.h`, `_engine.cpp`.
+Из `../../LAYERS.md`: `module_otaclient` — OTA-клиент: manifest, мини-HTTP. Слои выделены:
+`module_otaclient_types.h` (define'ы, `strOtaClientConfig`, `ManifestEntry`),
+`module_otaclient.cpp` (шаблонный блок), `module_otaclient_engine.cpp` (манифест, HTTP,
+автомат обновления).
 
 ## Ссылки
 
